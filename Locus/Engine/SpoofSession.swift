@@ -78,6 +78,11 @@ final class SpoofSession: ObservableObject {
     @Published var lastError: String?
     @Published var isBusy = false
     @Published var joystickActive = false
+    /// Live route telemetry while following a route (nil when not driving a route).
+    @Published var driveInfo: DriveTelemetry?
+    @Published var routePaused = false
+    /// Map camera follows the moving position during a route.
+    @Published var followCamera = true
 
     @Published var favorites: [SavedPlace] = []
     @Published var recents: [SavedPlace] = []
@@ -116,6 +121,8 @@ final class SpoofSession: ObservableObject {
     func stop(pairing: PairingStore) {
         routeTask?.cancel()
         routeTask = nil
+        driveInfo = nil
+        routePaused = false
         stopJoystick()
         stopResend()
         stopHealth()
@@ -180,41 +187,124 @@ final class SpoofSession: ObservableObject {
         joystickTimer = nil
     }
 
+    /// Plain route follow (drawn path / GPX) without traffic data.
     func followRoute(_ coordinates: [CLLocationCoordinate2D], pairing: PairingStore) {
-        guard pairing.hasPairingFile, coordinates.count >= 2 else { return }
+        guard coordinates.count >= 2 else { return }
+        let mode = travelMode
+        Task {
+            let plan = await DrivePlanner.plan(route: coordinates, mode: mode, followRules: false)
+            self.startDrive(plan, pairing: pairing)
+        }
+    }
+
+    /// Follows a planned route in real time: speed limits, curves, red lights, stop signs.
+    func startDrive(_ plan: DrivePlan, pairing: PairingStore) {
+        guard pairing.hasPairingFile else {
+            lastError = "Import an RPPairing file in Settings first."
+            return
+        }
+        guard plan.points.count >= 2 else { return }
         routeTask?.cancel()
         stopJoystick()
-        let mode = travelMode
+        routePaused = false
+        driveInfo = DriveTelemetry(
+            remaining: plan.totalDistance,
+            eta: plan.estimatedDuration,
+            heading: plan.heading(at: 0),
+            mode: plan.mode
+        )
+        apply(plan.points[0], pairing: pairing, markRecent: true)
+
         routeTask = Task { [weak self] in
-            guard let self else { return }
-            var previous = coordinates[0]
-            await MainActor.run {
-                self.apply(previous, pairing: pairing, markRecent: true)
+            let tick: TimeInterval = 1.0
+            var s = 0.0
+            var handledStops: Set<Int> = []
+            let stopIndices = plan.stops.keys.sorted()
+
+            func sleep(_ seconds: TimeInterval) async {
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
             }
-            for next in coordinates.dropFirst() {
-                if Task.isCancelled { break }
-                let distance = CLLocation(latitude: previous.latitude, longitude: previous.longitude)
-                    .distance(from: CLLocation(latitude: next.latitude, longitude: next.longitude))
-                var speed = mode.baseSpeed * Double.random(in: 0.88...1.12)
-                speed = max(0.8, speed)
-                let stepMeters: CLLocationDistance = min(12, max(4, speed * 0.5))
-                let steps = max(1, Int(ceil(distance / stepMeters)))
-                for i in 1...steps {
-                    if Task.isCancelled { break }
-                    let t = Double(i) / Double(steps)
-                    let coord = CLLocationCoordinate2D(
-                        latitude: previous.latitude + (next.latitude - previous.latitude) * t,
-                        longitude: previous.longitude + (next.longitude - previous.longitude) * t
-                    )
-                    let delay = stepMeters / speed
-                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                    await MainActor.run {
-                        self.apply(coord, pairing: pairing, markRecent: false)
-                    }
+
+            while !Task.isCancelled {
+                guard let self else { return }
+                if self.routePaused {
+                    self.driveInfo?.state = .paused
+                    self.driveInfo?.speed = 0
+                    await sleep(0.5)
+                    continue
                 }
-                previous = next
+
+                let v = max(plan.speed(at: s), 0.7)
+                var nextS = s + v * tick
+
+                // Arriving at a planned stop: halt exactly there and wait.
+                if let stopIndex = stopIndices.first(where: { !handledStops.contains($0) && plan.cumulative[$0] <= nextS }) {
+                    nextS = plan.cumulative[stopIndex]
+                    handledStops.insert(stopIndex)
+                    s = nextS
+                    self.apply(plan.coordinate(at: s), pairing: pairing, markRecent: false)
+                    let wait: TimeInterval
+                    switch plan.stops[stopIndex] {
+                    case .redLight(let w)?: wait = w
+                    case .stopSign(let w)?: wait = w
+                    case nil: wait = 0
+                    }
+                    var left = wait
+                    while left > 0, !Task.isCancelled {
+                        if !self.routePaused {
+                            if case .redLight? = plan.stops[stopIndex] {
+                                self.driveInfo?.state = .redLight(secondsLeft: Int(left.rounded(.up)))
+                            } else {
+                                self.driveInfo?.state = .stopSign
+                            }
+                            self.updateTelemetry(plan: plan, distance: s, speed: 0)
+                            left -= 1
+                        }
+                        await sleep(1)
+                    }
+                    continue
+                }
+
+                if nextS >= plan.totalDistance {
+                    s = plan.totalDistance
+                    self.apply(plan.points[plan.points.count - 1], pairing: pairing, markRecent: false)
+                    self.driveInfo?.state = .arrived
+                    self.updateTelemetry(plan: plan, distance: s, speed: 0)
+                    self.routeTask = nil
+                    return
+                }
+
+                s = nextS
+                self.apply(plan.coordinate(at: s), pairing: pairing, markRecent: false)
+                self.driveInfo?.state = .driving
+                // Report a slightly noisy speed like a real GPS would.
+                self.updateTelemetry(plan: plan, distance: s, speed: plan.speed(at: s) * Double.random(in: 0.985...1.015))
+                await sleep(tick)
             }
         }
+    }
+
+    func toggleRoutePause() {
+        guard driveInfo != nil else { return }
+        routePaused.toggle()
+    }
+
+    /// Ends the route but keeps spoofing at the current position.
+    func endRoute() {
+        routeTask?.cancel()
+        routeTask = nil
+        routePaused = false
+        driveInfo = nil
+    }
+
+    private func updateTelemetry(plan: DrivePlan, distance s: Double, speed: Double) {
+        guard driveInfo != nil else { return }
+        driveInfo?.speed = speed
+        driveInfo?.limit = plan.limits[plan.index(at: s)]
+        driveInfo?.remaining = max(0, plan.totalDistance - s)
+        driveInfo?.eta = plan.timeRemaining(from: s)
+        driveInfo?.progress = plan.totalDistance > 0 ? s / plan.totalDistance : 1
+        driveInfo?.heading = plan.heading(at: s)
     }
 
     func addFavorite(name: String, coordinate: CLLocationCoordinate2D) {

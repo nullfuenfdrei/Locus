@@ -13,12 +13,19 @@ struct RootView: View {
         ZStack(alignment: .bottom) {
             MapHomeView()
 
-            BottomControlsView(
-                showSettings: $showSettings,
-                showPlaces: $showPlaces
-            )
+            VStack(spacing: 10) {
+                if let info = session.driveInfo {
+                    DriveHUD(info: info)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+                BottomControlsView(
+                    showSettings: $showSettings,
+                    showPlaces: $showPlaces
+                )
+            }
             .padding(.horizontal, 16)
             .padding(.bottom, 8)
+            .animation(.snappy, value: session.driveInfo == nil)
         }
         .sheet(isPresented: $showSettings) {
             SettingsView()
@@ -173,6 +180,7 @@ struct BottomControlsView: View {
                 .frame(maxWidth: .infinity, alignment: .trailing)
             }
 
+            if session.driveInfo == nil {
             HStack(spacing: 8) {
                 ForEach(TravelMode.allCases) { mode in
                     let selected = session.travelMode == mode
@@ -191,6 +199,20 @@ struct BottomControlsView: View {
                     .buttonStyle(.plain)
                 }
                 Spacer(minLength: 0)
+                Button {
+                    NotificationCenter.default.post(name: .locusOpenTripPlanner, object: nil)
+                } label: {
+                    Label("Trip", systemImage: "arrow.triangle.turn.up.right.diamond.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 14)
+                        .frame(height: 40)
+                        .background(Capsule().fill(LocusTheme.accentSecondary))
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Plan a trip")
+            }
             }
 
             HStack(spacing: 10) {

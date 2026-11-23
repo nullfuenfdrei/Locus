@@ -9,8 +9,10 @@ struct MapHomeView: View {
     @State private var position: MapCameraPosition = .userLocation(fallback: .automatic)
     @State private var searchText = ""
     @FocusState private var searchFocused: Bool
-    @State private var routeStart: CLLocationCoordinate2D?
-    @State private var routeEnd: CLLocationCoordinate2D?
+    @State private var routeDestination: RouteDestination?
+    @State private var plannedDrive: DrivePlan?
+    @State private var followRules = true
+    @State private var cameraHeading: Double = 0
     @State private var routeCoords: [CLLocationCoordinate2D] = []
     @State private var isRouting = false
     @State private var showRouteSheet = false
@@ -85,18 +87,30 @@ struct MapHomeView: View {
                             )
                         }
                     }
-                    if let sim = session.simulated {
-                        Annotation("Spoof", coordinate: sim) {
-                            ZStack {
-                                Circle().fill(LocusTheme.accent.opacity(0.25)).frame(width: 44, height: 44)
-                                Circle().fill(LocusTheme.accent).frame(width: 14, height: 14)
-                                    .overlay(Circle().stroke(.white, lineWidth: 2))
-                            }
+                    if routeCoords.count > 1 {
+                        if let info = session.driveInfo, let plan = plannedDrive, plan.points.count > 1 {
+                            let split = min(plan.points.count - 1, max(1, plan.index(at: info.progress * plan.totalDistance)))
+                            MapPolyline(coordinates: Array(plan.points[0...split]))
+                                .stroke(Color.gray.opacity(0.7), style: StrokeStyle(lineWidth: 6, lineCap: .round, lineJoin: .round))
+                            MapPolyline(coordinates: Array(plan.points[split...]))
+                                .stroke(LocusTheme.accent, style: StrokeStyle(lineWidth: 7, lineCap: .round, lineJoin: .round))
+                        } else {
+                            MapPolyline(coordinates: routeCoords)
+                                .stroke(LocusTheme.accent, style: StrokeStyle(lineWidth: 6, lineCap: .round, lineJoin: .round))
                         }
                     }
-                    if routeCoords.count > 1 {
-                        MapPolyline(coordinates: routeCoords)
-                            .stroke(LocusTheme.accent, lineWidth: 5)
+                    if let destination = routeDestination, routeCoords.count > 1 {
+                        Annotation(destination.name, coordinate: destination.coordinate, anchor: .center) {
+                            Image(systemName: "flag.checkered.circle.fill")
+                                .font(.title)
+                                .foregroundStyle(.white, LocusTheme.accentSecondary)
+                                .shadow(radius: 3)
+                        }
+                    }
+                    if let sim = session.simulated {
+                        Annotation("", coordinate: sim, anchor: .center) {
+                            SpoofMarker(info: session.driveInfo, cameraHeading: cameraHeading)
+                        }
                     }
                     if drawnPath.count > 1 {
                         MapPolyline(coordinates: drawnPath)
@@ -105,6 +119,9 @@ struct MapHomeView: View {
                 }
                 .mapStyle(mapStyle)
                 .mapControlVisibility(.hidden)
+                .onMapCameraChange(frequency: .continuous) { context in
+                    cameraHeading = context.camera.heading
+                }
                 .onTapGesture { point in
                     searchFocused = false
                     guard !suppressNextMapTap, !isDraggingPin else { return }
@@ -122,6 +139,15 @@ struct MapHomeView: View {
         .onChange(of: session.pin?.latitude) { _, newValue in
             if newValue == nil { pinSelected = false }
         }
+        .onChange(of: session.driveInfo?.progress) { _, _ in
+            followCar()
+        }
+        .onChange(of: session.followCamera) { _, _ in
+            followCar()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .locusOpenTripPlanner)) { _ in
+            showRouteSheet = true
+        }
         .onReceive(NotificationCenter.default.publisher(for: .locusImportGPX)) { note in
             guard let url = note.object as? URL else { return }
             importGPX(url)
@@ -133,20 +159,25 @@ struct MapHomeView: View {
         }
         .sheet(isPresented: $showRouteSheet) {
             RoutePlannerSheet(
-                start: $routeStart,
-                end: $routeEnd,
+                destination: $routeDestination,
+                plan: $plannedDrive,
                 isRouting: $isRouting,
+                followRules: $followRules,
+                hasDrawnPath: drawnPath.count > 1,
                 onBuild: buildRoadRoute,
-                onPlay: playRoute,
+                onStart: playRoute,
                 onImportGPX: { showGPXImporter = true },
                 onExportGPX: exportGPX,
                 onUseDrawn: {
                     routeCoords = RouteBuilder.sample(coordinates: drawnPath, every: 10)
+                    routeDestination = nil
                     drawnPath.removeAll()
                     drawMode = false
+                    planCurrentRoute()
                 }
             )
             .presentationDetents([.medium, .large])
+            .presentationBackgroundInteraction(.enabled(upThrough: .medium))
         }
     }
 
@@ -354,19 +385,32 @@ struct MapHomeView: View {
         }
     }
 
+    private var routeStartCoordinate: CLLocationCoordinate2D? {
+        session.simulated ?? session.realCoordinate ?? session.pin
+    }
+
     private func buildRoadRoute() {
-        guard let start = routeStart ?? session.simulated ?? session.pin,
-              let end = routeEnd else {
-            session.lastError = "Set a route start and end."
+        guard let start = routeStartCoordinate else {
+            session.lastError = "Teleport somewhere or allow location access first."
+            return
+        }
+        guard let end = routeDestination?.coordinate else {
+            session.lastError = "Choose a destination."
             return
         }
         isRouting = true
+        plannedDrive = nil
+        let mode = session.travelMode
+        let rules = followRules
         Task {
             do {
-                let coords = try await RouteBuilder.roadRoute(from: start, to: end, mode: session.travelMode)
+                let coords = try await RouteBuilder.roadRoute(from: start, to: end, mode: mode)
+                let plan = await DrivePlanner.plan(route: coords, mode: mode, followRules: rules)
                 await MainActor.run {
                     routeCoords = coords
+                    withAnimation(.snappy) { plannedDrive = plan }
                     isRouting = false
+                    frame(coords)
                 }
             } catch {
                 await MainActor.run {
@@ -377,20 +421,70 @@ struct MapHomeView: View {
         }
     }
 
+    /// Plans an already known path (drawn / GPX) with the current settings.
+    private func planCurrentRoute() {
+        let path = routeCoords
+        guard path.count >= 2 else { return }
+        isRouting = true
+        let mode = session.travelMode
+        let rules = followRules
+        Task {
+            let plan = await DrivePlanner.plan(route: path, mode: mode, followRules: rules)
+            await MainActor.run {
+                withAnimation(.snappy) { plannedDrive = plan }
+                isRouting = false
+            }
+        }
+    }
+
     private func playRoute() {
-        let path = routeCoords.isEmpty ? drawnPath : routeCoords
-        guard path.count >= 2 else {
-            session.lastError = "Build or draw a route first."
+        guard let plan = plannedDrive else {
+            session.lastError = "Calculate a route first."
             return
         }
         showRouteSheet = false
-        session.followRoute(path, pairing: pairing)
+        session.followCamera = true
+        session.startDrive(plan, pairing: pairing)
+    }
+
+    private func frame(_ coords: [CLLocationCoordinate2D]) {
+        guard let first = coords.first else { return }
+        var minLat = first.latitude, maxLat = first.latitude
+        var minLon = first.longitude, maxLon = first.longitude
+        for c in coords {
+            minLat = min(minLat, c.latitude); maxLat = max(maxLat, c.latitude)
+            minLon = min(minLon, c.longitude); maxLon = max(maxLon, c.longitude)
+        }
+        let center = CLLocationCoordinate2D(latitude: (minLat + maxLat) / 2, longitude: (minLon + maxLon) / 2)
+        let span = MKCoordinateSpan(
+            latitudeDelta: max(0.005, (maxLat - minLat) * 1.5),
+            longitudeDelta: max(0.005, (maxLon - minLon) * 1.5)
+        )
+        withAnimation(.easeInOut(duration: 0.6)) {
+            position = .region(MKCoordinateRegion(center: center, span: span))
+        }
+    }
+
+    /// Navigation-style camera that rides along with the spoofed position.
+    private func followCar() {
+        guard session.followCamera, let info = session.driveInfo, let sim = session.simulated else { return }
+        let distance: CLLocationDistance = info.mode == .drive ? 750 : 380
+        withAnimation(.linear(duration: 1)) {
+            position = .camera(MapCamera(
+                centerCoordinate: sim,
+                distance: distance,
+                heading: info.heading * 180 / .pi,
+                pitch: 55
+            ))
+        }
     }
 
     private func importGPX(_ url: URL) {
         do {
             let coords = try GPXCodec.parse(url)
             routeCoords = RouteBuilder.sample(coordinates: coords, every: 10)
+            routeDestination = nil
+            planCurrentRoute()
             if let first = coords.first {
                 session.pin = first
                 position = .region(MKCoordinateRegion(center: first, latitudinalMeters: 2000, longitudinalMeters: 2000))
@@ -449,5 +543,31 @@ final class PlaceSearchCompleter: NSObject, ObservableObject, MKLocalSearchCompl
 
     nonisolated func completer(_ completer: MKLocalSearchCompleter, didFailWithError error: Error) {
         Task { @MainActor in self.results = [] }
+    }
+}
+
+/// The spoofed position: a dot when parked, a heading arrow while following a route.
+struct SpoofMarker: View {
+    let info: DriveTelemetry?
+    let cameraHeading: Double
+
+    var body: some View {
+        if let info {
+            ZStack {
+                Circle().fill(LocusTheme.accent.opacity(0.22)).frame(width: 52, height: 52)
+                Circle().fill(.white).frame(width: 32, height: 32).shadow(radius: 3)
+                Image(systemName: "location.north.fill")
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundStyle(LocusTheme.accent)
+                    .rotationEffect(.radians(info.heading - cameraHeading * .pi / 180))
+            }
+            .animation(.linear(duration: 1), value: info.heading)
+        } else {
+            ZStack {
+                Circle().fill(LocusTheme.accent.opacity(0.25)).frame(width: 44, height: 44)
+                Circle().fill(LocusTheme.accent).frame(width: 14, height: 14)
+                    .overlay(Circle().stroke(.white, lineWidth: 2))
+            }
+        }
     }
 }
